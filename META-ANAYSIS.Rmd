@@ -1,0 +1,808 @@
+---
+title: "Meta análisis"
+author: "Laura Valbuena"
+date: "2025-07-23"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(readr)
+library(tidyverse)
+library(lme4) # Para modelos GLM (lmer sin random effects es un lm)
+library(metafor) # Para qlogis
+library(sjPlot)
+
+```
+
+```{r}
+data_meta19 = read_csv("./data_meta19.csv", show_col_types = FALSE)
+data_meta23 = read_csv("./data_meta23.csv", show_col_types = FALSE)
+```
+
+```{r}
+data_meta23 <- data_meta23 %>%
+  mutate(
+    `Days to cover` = na_if(`Days to cover`, "Without cover"), 
+    `Days to cover` = as.numeric(`Days to cover`)           
+  )
+```
+
+```{r}
+data_meta19 = data_meta19 %>%
+  mutate(Study = "Study_2019",
+         Mortality_Prop = `Mortality (%)` / 100)
+
+data_meta23 = data_meta23 %>%
+  mutate(Study = "Study_2023",
+         Mortality_Prop = `Mortality (%)` / 100)
+```
+
+```{r}
+all_data = bind_rows(data_meta19, data_meta23)
+```
+
+```{r}
+all_data <- all_data %>%
+  mutate(
+    Mortality_Adj = ifelse(Mortality_Prop == 0, 0.001, ifelse(Mortality_Prop == 1, 0.999, Mortality_Prop)),
+    yi = qlogis(Mortality_Adj)
+  )
+```
+
+```{r}
+all_data <- all_data %>%
+  mutate(
+    `Days to cover` = as.character(`Days to cover`), # Ensure it's character if not already
+    # Replace actual NA values in `Days to cover` with "Without cover" string
+    `Days to cover` = if_else(is.na(`Days to cover`), "Without cover", `Days to cover`),
+    # Create a factor variable, setting "Without cover" as the reference level
+    Days_to_cover_Factor = factor(`Days to cover`,
+                                  levels = c("Without cover",
+                                             sort(unique(`Days to cover`[`Days to cover` != "Without cover"]))
+                                             )
+                                  )
+  )
+```
+
+```{r}
+all_data <- all_data %>%
+  # Asegurar Latitud y Longitud son numéricas
+  mutate(
+    Latitude = as.numeric(Latitude),
+    Longitude = as.numeric(Longitude)
+  ) %>%
+  # Convertir a factores y manejar NAs explícitamente para todas las variables
+  mutate(
+    Variety = as.factor(Variety),
+    Variety = fct_explicit_na(Variety, na_level = "Unknown_Variety"),
+
+    Municipality = as.factor(Municipality),
+    Municipality = fct_explicit_na(Municipality, na_level = "Unknown_Municipality"),
+
+    `Planting system` = as.factor(`Planting system`),
+    `Planting system` = fct_explicit_na(`Planting system`, na_level = "Unknown_PlantingSystem"),
+
+    `Pre active ingredient` = as.factor(`Pre active ingredient`),
+    `Pre active ingredient` = fct_explicit_na(`Pre active ingredient`, na_level = "Unknown_PreAI"),
+
+    `Pos active ingredient` = as.factor(`Pos active ingredient`),
+    `Pos active ingredient` = fct_explicit_na(`Pos active ingredient`, na_level = "Unknown_PosAI"),
+
+    `Rotative crop` = as.factor(`Rotative crop`),
+    `Rotative crop` = fct_explicit_na(`Rotative crop`, na_level = "Unknown_RotativeCrop")
+  )
+```
+
+```{r}
+initial_rows <- nrow(all_data)
+all_data <- all_data %>%
+  drop_na(yi) %>%
+  filter(is.finite(yi))
+rows_removed <- initial_rows - nrow(all_data)
+if (rows_removed > 0) {
+  message(paste("Removed", rows_removed, "rows due to NA or infinite yi values (missing or problematic Mortality data)."))
+}
+```
+
+```{r}
+all_data$Municipality <- relevel(all_data$Municipality, ref = "TANGANCICUARO")
+```
+
+```{r}
+model_lmer_custom <- lmer(
+  yi ~ Municipality + Latitude + Longitude +
+       (1 | Variety) +
+       (1 | Days_to_cover_Factor) +
+       (1 | `Planting system`) +
+       (1 | `Pre active ingredient`) +
+       (1 | `Pos active ingredient`) +
+       (1 | `Rotative crop`),
+  data = all_data,
+  control = lmerControl(optimizer ="bobyqa", optCtrl = list(maxfun=2e5)) # Añadimos un control para ayudar con la convergencia en modelos complejos
+)
+
+summary(model_lmer_custom)
+
+# Para ver las varianzas de los efectos aleatorios
+VarCorr(model_lmer_custom)
+```
+
+```{r}
+print(model_lmer_custom, correlation=TRUE)
+```
+
+
+```{r}
+library(broom.mixed)
+coefs <- broom.mixed::tidy(model_lmer_custom, effects = "fixed", conf.int = TRUE)
+
+# Eliminar el intercepto si no lo quieres en la gráfica
+coefs <- coefs %>% filter(term != "(Intercept)")
+
+# Gráfico
+ggplot(coefs, aes(x = estimate, y = term)) +
+  geom_point(color = "darkblue") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  theme_classic(base_size = 14) +
+  labs(title = "Fixed effects",
+       x = "Estimation (± CI 95%)",
+       y = "Variable")
+```
+```{r}
+g <- plot_model(model_lmer_custom, type = "est", show.p = TRUE)
+g + theme_classic(base_size = 14)
+
+```
+
+```{r}
+# Establece el tema clásico por defecto para ggplot
+theme_set(theme_classic(base_size = 14))
+
+# Ahora genera el gráfico
+plot_model(model_lmer_custom, type = "re")
+
+
+```
+
+
+
+```{r}
+library(sjPlot)
+library(ggplot2)
+library(scales) # Para el formato de porcentaje en el eje Y
+
+# --- Gráficos de Efectos Fijos ---
+# Estos gráficos muestran cómo la mortalidad predicha cambia con cada variable fija,
+# manteniendo las otras variables en sus valores de referencia o promedio.
+
+cat("### Gráficos de Efectos Fijos\n")
+
+# 1. Variety
+plot_variety_new <- plot_model(model_lmer_custom, type = "pred", terms = "Variety",
+                               transform = plogis, # Convierte a escala de probabilidad (0-1)
+                               axis.title.y = "Predicted Mortality (%)",
+                               title = "Mortality (%) Variety") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) + # Formatea a %
+  labs(x = "Variety") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) # Rotar etiquetas si son largas
+print(plot_variety_new)
+
+# 2. Municipality
+plot_municipality_new <- plot_model(model_lmer_custom, type = "pred", terms = "Municipality",
+                                    transform = plogis,
+                                    axis.title.y = "Predicted Mortality (%)",
+                                    title = "Mortality (%) Municipality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Municipality") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(plot_municipality_new)
+
+# 3. Latitude
+plot_latitude_new <- plot_model(model_lmer_custom, type = "pred", terms = "Latitude",
+                                transform = plogis,
+                                axis.title.y = "Predicted Mortality (%)",
+                                title = "Latitude effect in mortality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Latitude") +
+  theme_classic()
+print(plot_latitude_new)
+
+# 4. Longitude
+plot_longitude_new <- plot_model(model_lmer_custom, type = "pred", terms = "Longitude",
+                                 transform = plogis,
+                                 axis.title.y = "Predicted Mortality (%)",
+                                 title = "Longitude effect in mortality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Longitude") +
+  theme_classic()
+print(plot_longitude_new)
+
+# --- Gráficos de Efectos Aleatorios ---
+# Estos gráficos muestran la desviación estimada del intercepto para cada nivel de tus variables aleatorias.
+# Un rango más amplio (barras más largas) indica mayor variabilidad explicada por esa variable aleatoria.
+
+cat("\n### Gráficos de Efectos Aleatorios\n")
+
+# Para todos los efectos aleatorios en un solo panel (si hay muchos niveles, puede ser denso)
+plot_random_effects_all_new <- plot_model(model_lmer_custom, type = "re",
+                                          title = "Intercept deviation by random effect") +
+  theme_classic()
+print(plot_random_effects_all_new)
+
+# Gráficos individuales para cada efecto aleatorio (más claridad si hay muchos)
+
+# 1. Days_to_cover_Factor
+plot_days_to_cover_random <- plot_model(model_lmer_custom, type = "re", terms = "Days_to_cover_Factor",
+                                        title = "Intercept deviation by days to cover",
+                                        axis.title.y = "Desviation (Logit scale)") +
+  theme_classic()
+print(plot_days_to_cover_random)
+
+# 2. Planting system
+plot_planting_system_random <- plot_model(model_lmer_custom, type = "re", terms = "`Planting system`",
+                                          title = "Intercept deviation by planting system",
+                                          axis.title.y = "Desviation (Logit scale)") +
+  theme_classic()
+print(plot_planting_system_random)
+
+# 3. Pre active ingredient
+plot_pre_ai_random <- plot_model(model_lmer_custom, type = "re", terms = "`Pre active ingredient`",
+                                 title = "Intercept deviation by pre active ingredient",
+                                 axis.title.y = "Desviation (Logit scale)") +
+  theme_classic()
+print(plot_pre_ai_random)
+
+# 4. Pos active ingredient
+plot_pos_ai_random <- plot_model(model_lmer_custom, type = "re", terms = "`Pos active ingredient`",
+                                 title = "Intercept deviation by post active ingredient",
+                                 axis.title.y = "Desviation (Logit scale)") +
+  theme_classic()
+print(plot_pos_ai_random)
+
+# 5. Rotative crop
+plot_rotative_crop_random <- plot_model(model_lmer_custom, type = "re", terms = "`Rotative crop`",
+                                        title = "Intercept deviation by pre active ingredient rotation crop",
+                                        axis.title.y = "Desviation (Logit scale)") +
+  theme_classic()
+print(plot_rotative_crop_random)
+
+library(performance) 
+cat("\n### Gráficos de Diagnóstico del Modelo\n")
+check_model(model_lmer_custom)
+```
+
+```{r}
+# Asegúrate de tener cargados los paquetes necesarios
+#install.packages("performance", dependencies = TRUE)
+library(performance)
+library(ggplot2) # Para visualizar los objetos ggplot
+
+# Suponiendo que 'model_lmer_custom' es el modelo que estás usando
+# (el mismo que usamos en el paso anterior)
+
+cat("--- Gráficos de Diagnóstico Individuales ---\n")
+
+# 1. Posterior Predictive Check
+# Compara la distribución de los datos observados con la de los datos predichos por el modelo.
+# Las líneas deben superponerse bien.
+plot(check_predictions(model_lmer_custom))
+
+# 2. Linearity (Linealidad)
+# Evalúa si la relación entre las variables predictoras y la respuesta es lineal.
+# La línea roja debe ser plana y horizontal.
+#plot(check_linearity(model_lmer_custom))
+
+# 3. Homogeneity of Variance (Homogeneidad de Varianza)
+# Comprueba si la varianza de los residuos es constante en todos los niveles de los predictores.
+# La línea roja debe ser plana y horizontal.
+#plot(check_homogeneity(model_lmer_custom))
+
+# 4. Influential Observations (Observaciones Influyentes)
+# Identifica observaciones que tienen un gran impacto en las estimaciones del modelo.
+# Los puntos deben estar dentro de las líneas de contorno.
+plot(check_outliers(model_lmer_custom))
+
+# 5. Collinearity (Colinealidad)
+# Muestra la VIF (Factor de Inflación de Varianza) para cada predictor, indicando colinealidad.
+# Valores altos (generalmente > 5 o > 10) sugieren problemas.
+plot(check_collinearity(model_lmer_custom))
+
+# 6. Normality of Residuals (Normalidad de los Residuos)
+# Chequea si los residuos están distribuidos normalmente (QQ-plot).
+# Los puntos deben seguir la línea diagonal.
+plot(check_normality(model_lmer_custom))
+
+# 7. Normality of Random Effects (Normalidad de los Efectos Aleatorios)
+# Verifica si los efectos aleatorios de cada grupo están distribuidos normalmente.
+# Los puntos deben seguir la línea diagonal.
+
+# Pos active ingredient
+plot(check_normality(model_lmer_custom, effects = "random", random_terms = "`Pos active ingredient`"))
+
+# Pre active ingredient
+plot(check_normality(model_lmer_custom, effects = "random", random_terms = "`Pre active ingredient`"))
+
+# Days_to_cover_Factor
+plot(check_normality(model_lmer_custom, effects = "random", random_terms = "Days_to_cover_Factor"))
+
+# Rotative crop
+plot(check_normality(model_lmer_custom, effects = "random", random_terms = "`Rotative crop`"))
+
+# Planting system
+plot(check_normality(model_lmer_custom, effects = "random", random_terms = "`Planting system`"))
+
+# Si también tuvieras 'Study' como random, lo incluirías:
+# plot(check_normality(model_lmer_custom, effects = "random", random_terms = "Study"))
+
+# Si Latitude o Longitude hubieran sido random (aunque no se recomienda si son continuas):
+# plot(check_normality(model_lmer_custom, effects = "random", random_terms = "Latitude"))
+# plot(check_normality(model_lmer_custom, effects = "random", random_terms = "Longitude"))
+```
+
+
+```{r}
+library(ggplot2) # Asegúrate de que ggplot2 esté cargado
+
+# --- Gráfico de Linealidad Manual ---
+# Extraer residuos y valores ajustados de tu modelo
+residuals_df <- data.frame(
+  Fitted = fitted(model_lmer_custom),
+  Residuals = residuals(model_lmer_custom)
+)
+
+# Graficar residuos vs. valores ajustados para chequear linealidad
+plot_manual_linearity <- ggplot(residuals_df, aes(x = Fitted, y = Residuals)) +
+  geom_point(alpha = 0.6) + # Puntos de los residuos
+  geom_smooth(method = "loess", se = FALSE, color = "blue") + # Línea de tendencia (suavizado)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") + # Línea de referencia en 0
+  labs(title = "Lineality: Residues vs. Adjusted Values",
+       x = "Adjusted Values",
+       y = "Residues") +
+  theme_classic()
+
+print(plot_manual_linearity)
+```
+
+```{r}
+library(ggplot2)
+library(sjPlot)
+library(scales) 
+
+cat("### Visualización de Efectos ALEATORIOS (Desviaciones del Intercepto)\n")
+
+# 1. Days_to_cover_Factor (Ahora es efecto aleatorio)
+# Opción 1: Visualizar los datos reales por categoría (mismo código, válido)
+plot_days_to_cover_real <- ggplot(all_data, aes(x = Days_to_cover_Factor, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality days to cover",
+       x = "Days to cover",
+       y = "Mortality (%)") +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(plot_days_to_cover_real)
+
+# Opción 2: Predicción del modelo como efecto aleatorio (desviaciones del intercepto)
+plot_days_to_cover_random_effect <- plot_model(model_lmer_custom, type = "re", terms = "Days_to_cover_Factor",
+                                               title = "Intercept deviation by days to cover",
+                                               axis.title.y = "Intercept deviation (Logit scale)") +
+  theme_classic()
+print(plot_days_to_cover_random_effect)
+
+# 2. Planting system (Ahora es efecto aleatorio)
+plot_planting_system_real <- ggplot(all_data, aes(x = `Planting system`, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) by plating system",
+       x = "Planting system",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_planting_system_real)
+
+plot_planting_system_random_effect <- plot_model(model_lmer_custom, type = "re", terms = "`Planting system`",
+                                                title = "Intercept deviation by planting system",
+                                                axis.title.y = "Intercept deviation (Logit scale)") +
+  theme_classic()
+print(plot_planting_system_random_effect)
+
+# 3. Pre active ingredient (Ahora es efecto aleatorio)
+plot_pre_ai_real <- ggplot(all_data, aes(x = `Pre active ingredient`, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) by pre active ingredient",
+       x = "Pre sowing active ingredient",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_pre_ai_real)
+
+plot_pre_ai_random_effect <- plot_model(model_lmer_custom, type = "re", terms = "`Pre active ingredient`",
+                                        title = "Deviation intercept pre active ingredient",
+                                        axis.title.y = "Deviation intercept (Logit scale)") +
+  theme_classic()
+print(plot_pre_ai_random_effect)
+
+# 4. Pos active ingredient (Ahora es efecto aleatorio)
+plot_pos_ai_real <- ggplot(all_data, aes(x = `Pos active ingredient`, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) by pos active ingredient",
+       x = "Post sowing active ingredient",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_pos_ai_real)
+
+plot_pos_ai_random_effect <- plot_model(model_lmer_custom, type = "re", terms = "`Pos active ingredient`",
+                                        title = "Intercept deviation pos active ingredient",
+                                        axis.title.y = "Deviation intercept (Logit scale)") +
+  theme_classic()
+print(plot_pos_ai_random_effect)
+
+# 5. Rotative crop (Ahora es efecto aleatorio)
+plot_rotative_crop_real <- ggplot(all_data, aes(x = `Rotative crop`, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) rotative crop",
+       x = "Rotative crop",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_rotative_crop_real)
+
+plot_rotative_crop_random_effect <- plot_model(model_lmer_custom, type = "re", terms = "`Rotative crop`",
+                                               title = "Intercept deviation by rotative crop",
+                                               axis.title.y = "Intercept deviation (Logit scale)") +
+  theme_classic()
+print(plot_rotative_crop_random_effect)
+
+# --- Visualización para Variables que son Efectos FIJOS en model_lmer_custom ---
+
+cat("\n### Visualización de Efectos FIJOS (Predicciones del Modelo)\n")
+
+# 1. Variety (Fija)
+# Visualización de datos reales (mismo código, válido)
+plot_variety_real <- ggplot(all_data, aes(x = Variety, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) variety",
+       x = "Variety",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_variety_real)
+
+# Predicción del modelo para Variety (fija) - Usamos plot_model
+plot_variety_predicted <- plot_model(model_lmer_custom, type = "pred", terms = "Variety",
+                                     transform = plogis,
+                                     axis.title.y = "Predicted mortality (%)",
+                                     title = "Predicted mortality by variety") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Variety") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_variety_predicted)
+
+# 2. Municipality (Fija)
+plot_municipality_real <- ggplot(all_data, aes(x = Municipality, y = `Mortality (%)`)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Mortality (%) municipality",
+       x = "Municipality",
+       y = "Mortality (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_municipality_real)
+
+plot_municipality_predicted <- plot_model(model_lmer_custom, type = "pred", terms = "Municipality",
+                                         transform = plogis,
+                                         axis.title.y = "Predicted mortality (%)",
+                                         title = "Predicted mortality (%) municipality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Municipality") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(plot_municipality_predicted)
+
+# 3. Latitude (Fija)
+plot_latitude_real <- ggplot(all_data, aes(x = Latitude, y = `Mortality (%)`)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) + # Línea de tendencia lineal
+  labs(title = "Mortality (%) Latitude",
+       x = "Latitude",
+       y = "Mortality (%)") +
+  theme_classic()
+print(plot_latitude_real)
+
+plot_latitude_predicted <- plot_model(model_lmer_custom, type = "pred", terms = "Latitude",
+                                     transform = plogis,
+                                     axis.title.y = "Predicted mortality (%)",
+                                     title = "Latitude vs mortality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Latitude") +
+  theme_classic()
+print(plot_latitude_predicted)
+
+# 4. Longitude (Fija)
+plot_longitude_real <- ggplot(all_data, aes(x = Longitude, y = `Mortality (%)`)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) + # Línea de tendencia lineal
+  labs(title = "Mortality (%) Longitude",
+       x = "Longitude",
+       y = "Mortality (%)") +
+  theme_classic()
+print(plot_longitude_real)
+
+plot_longitude_predicted <- plot_model(model_lmer_custom, type = "pred", terms = "Longitude",
+                                      transform = plogis,
+                                      axis.title.y = "Predicted mortality (%)",
+                                      title = "Longitude effect in mortality") +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  labs(x = "Longitude") +
+  theme_classic()
+print(plot_longitude_predicted)
+```
+
+
+Prueba quitando variables con var 0 y planting system como fijo
+
+```{r}
+all_data$lat_c <- scale(all_data$Latitude, center = TRUE, scale = TRUE)
+all_data$lon_c <- scale(all_data$Longitude, center = TRUE, scale = TRUE)
+
+model2 <- lmer(
+  yi ~ Municipality + lat_c + lon_c +
+       (1 | Variety) +
+       (1 | Days_to_cover_Factor) +
+       (1 | `Pre active ingredient`) +
+       `Planting system`,  # como fijo
+  data = all_data,
+  control = lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+)
+isSingular(model2)
+summary(model2)
+VarCorr(model2)
+```
+```{r}
+all_data <- all_data %>%
+  rename(
+    Lat = Latitude,
+    Lon = Longitude,
+    Latitude = lat_c,
+    Longitude = lon_c
+    )
+```
+
+```{r}
+model3 <- lmer(
+  yi ~ Municipality + Latitude + Longitude +
+       (1 | Variety) +
+       (1 | Days_to_cover_Factor) +
+       (1 | `Pre active ingredient`) +
+       (1 | `Planting system`),
+  data = all_data,
+  control = lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5))
+)
+isSingular(model3)
+summary(model3)
+VarCorr(model3)
+```
+
+Comparacion de modelos
+```{r}
+AIC(model_lmer_custom, model2, model3)
+BIC(model_lmer_custom, model2, model3)
+```
+
+```{r}
+resid_df <- data.frame(
+  fitted = fitted(model3),
+  residuals = resid(model3)
+)
+
+ggplot(resid_df, aes(x = residuals)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(x = "Residuals", y = "Frequency") +
+  theme_classic() +
+  theme(
+    text = element_text(size = 20, family = "Times New Roman"),
+    axis.title = element_text(size = 20, family = "Times New Roman"),
+    axis.text = element_text(size = 20, family = "Times New Roman")
+  )
+```
+```{r}
+shapiro.test(resid_df$residuals)
+```
+
+```{r}
+ggplot(resid_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_classic() +
+  labs(
+    title = "Residuals vs. Fitted Values",
+    x = "Fitted Values",
+    y = "Residuals"
+  )
+
+ggplot(resid_df, aes(x = fitted, y = abs(residuals))) +
+  geom_point(alpha = 0.6, color = "darkorange") +
+  geom_smooth(method = "loess", color = "black", se = FALSE) +
+  theme_classic() +
+  labs(
+    title = "Magnitude of Residuals vs. Fitted Values",
+    x = "Fitted Values",
+    y = "|Residuals|"
+  )
+```
+```{r}
+library(lmtest)
+lm_model <- lm(residuals(model3, type = "pearson") ~ fitted(model3))
+bptest(lm_model)
+```
+
+```{r}
+plot_model(model3, type = "est", show.values = TRUE, value.offset = 0.3) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 20, family = "Times New Roman"),
+    axis.title = element_text(size = 20, family = "Times New Roman"),
+    axis.text = element_text(size = 20, family = "Times New Roman"),
+    plot.title = element_text(size = 20, family = "Times New Roman")
+  )
+```
+
+```{r}
+ranef_df <- ranef(model3, condVar = TRUE)
+
+for (grp in names(ranef_df)) {
+  grp_df <- ranef_df[[grp]]
+  grp_df$level <- rownames(grp_df)
+  
+  grp_df$level_wrapped <- sapply(grp_df$level, function(x) {
+    words <- strsplit(x, " ")[[1]]
+    if (length(words) > 3) {
+      return(paste(words[1:3], collapse = " ") %>% paste("\n", paste(words[4:length(words)], collapse = " "), sep = ""))
+    } else {
+      return(x)
+    }
+  })
+  
+  ggplot(grp_df, aes(x = reorder(level_wrapped, `(Intercept)`), y = `(Intercept)`)) +
+    geom_point(color = "blue", size = 3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    coord_flip() +
+    labs(x = grp, y = "Intercept Deviation",
+         title = paste("Random Effects -", grp)) +
+    theme_classic() +
+    theme(
+      text = element_text(size = 20, family = "Times New Roman"),
+      axis.title = element_text(size = 20, family = "Times New Roman"),
+      axis.text = element_text(size = 20, family = "Times New Roman"),
+      plot.title = element_text(size = 20, family = "Times New Roman")
+    ) -> p
+  print(p)
+}
+```
+```{r}
+pre_act_df <- ranef_df[["Pre active ingredient"]]
+pre_act_df$level <- rownames(pre_act_df)
+
+pre_act_df$level_wrapped <- sapply(pre_act_df$level, function(x) {
+  words <- strsplit(x, " ")[[1]]
+  if(length(words) > 5){
+    paste(paste(words[1:5], collapse = " "), "\n", paste(words[6:length(words)], collapse = " "))
+  } else { x }
+})
+
+p1 <- ggplot(pre_act_df, aes(x = reorder(level_wrapped, `(Intercept)`), y = `(Intercept)`)) +
+  geom_point(color = "blue", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(x = "Pre active ingredient", y = "Intercept Deviation",
+       title = "Random Effects - Pre active ingredient") +
+  theme_classic() +
+  theme(text = element_text(size = 20, family = "Times New Roman"),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 20),
+        plot.title = element_text(size = 20))
+ggsave("random_effects_pre_act_long.png", p1, width = 15 , height = 20, units = "in", dpi = 300)
+print(p1)
+```
+
+
+```{r}
+days_df <- ranef_df[["Days_to_cover_Factor"]]
+days_df$level <- rownames(days_df)
+days_df$level_wrapped <- days_df$level 
+
+p2 <- ggplot(days_df, aes(x = reorder(level_wrapped, `(Intercept)`), y = `(Intercept)`)) +
+  geom_point(color = "blue", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(x = "Days to Cover Factor", y = "Intercept Deviation",
+       title = "Random Effects - Days to Cover Factor") +
+  theme_classic() +
+  theme(text = element_text(size = 20, family = "Times New Roman"),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 18),
+        plot.title = element_text(size = 20))
+
+print(p2)
+```
+
+```{r}
+var_df <- ranef_df[["Variety"]]
+var_df$level <- rownames(var_df)
+var_df$level_wrapped <- var_df$level
+
+p3 <- ggplot(var_df, aes(x = reorder(level_wrapped, `(Intercept)`), y = `(Intercept)`)) +
+  geom_point(color = "blue", size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(x = "Variety", y = "Intercept Deviation",
+       title = "Random Effects - Variety") +
+  theme_classic() +
+  theme(text = element_text(size = 20, family = "Times New Roman"),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 18),
+        plot.title = element_text(size = 20))
+
+print(p3)
+```
+
+
+```{r}
+pred_marginal <- predict(model3, re.form = NA)
+pred_conditional <- predict(model3) 
+
+fixef(model3)  
+
+r_marginal <- cor(all_data$yi, pred_marginal)
+r_marginal
+
+r_conditional <- cor(all_data$yi, pred_conditional)
+r_conditional
+
+library(MuMIn)
+r.squaredGLMM(model3)
+
+rmse <- function(obs, pred) sqrt(mean((obs - pred)^2))
+
+rmse_marginal <- rmse(all_data$yi, pred_marginal)
+rmse_conditional <- rmse(all_data$yi, pred_conditional)
+
+rmse_marginal
+rmse_conditional
+
+```
+
+```{r}
+all_data_long <- all_data %>%
+  mutate(Pre_active_list = str_split(`Pre active ingredient`, "\\s*,\\s*|\\s+and\\s+")) %>%
+  unnest(Pre_active_list)
+
+all_data_long <- all_data_long %>%
+  mutate(`Pre_active_list` = recode(
+    `Pre_active_list`,
+    "Metalaxil" = "Metalaxil-M",
+    "Fosetil-aluminio" = "Fosetyl",
+    "Difenoconazol" = "Difenoconazole",
+    "Ciprodinil" = "Cyprodinil",
+    "Azoxistrobin" = "Azoxystrobin"
+  ))
+
+ggplot(all_data_long, aes(x = Pre_active_list, y = yi)) +
+  geom_boxplot(fill = "skyblue") +
+  coord_flip() +
+  labs(x = "Pre active ingredient", y = "Mortality") +
+  theme_classic()
+```
+
+
